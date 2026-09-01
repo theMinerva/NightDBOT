@@ -1,8 +1,17 @@
 (async () => {
-    // 👇 CHANGE THIS: Target category (Must use "رده:" prefix for Persian Wikipedia)
-    const categoryName = "رده:الگو:انتخابات و همه‌پرسی"; 
-    const summary = "اصلاح پیوندهای قرمز انگلیسی به معادل فارسی از طریق ویکی‌داده";
-    
+    // ================= CONFIGURATION =================
+    const config = {
+        // Options: "category" OR "links"
+        sourceType: "category", 
+        
+        // If "category": use "رده:..."
+        // If "links": use "کاربر:نام_کاربری_شما/articleswithredlinks"
+        sourceValue: "رده:خانواده داروین-وج‌وود", 
+        
+        summary: "اصلاح پیوندهای قرمز انگلیسی به معادل فارسی از طریق ویکی‌داده (تست ابزار)"
+    };
+    // =================================================
+
     console.log("1. در حال دریافت توکن ویرایش (CSRF)...");
     // Step 1: Get Edit Token
     const tokenRes = await fetch('/w/api.php?action=query&meta=tokens&format=json', { credentials: 'include' });
@@ -14,12 +23,12 @@
         return;
     }
 
-    // Helper: Get all pages in a category (handles pagination)
+    // Helper: Get all ARTICLES in a category (ignores subcategories/files)
     async function getCategoryMembers(catName) {
         let members = [];
         let continueToken = "";
         do {
-            let url = `/w/api.php?action=query&list=categorymembers&cmtitle=${encodeURIComponent(catName)}&cmlimit=500&format=json`;
+            let url = `/w/api.php?action=query&list=categorymembers&cmtitle=${encodeURIComponent(catName)}&cmlimit=500&cmtype=page&format=json`;
             if (continueToken) url += `&cmcontinue=${continueToken}`;
             
             const res = await fetch(url, { credentials: 'include' });
@@ -32,10 +41,35 @@
         return members;
     }
 
+    // Helper: Get all ARTICLES linked on a specific page
+    async function getPagesLinkedOnPage(pageTitle) {
+        let pages = [];
+        let continueToken = "";
+        do {
+            let url = `/w/api.php?action=query&generator=links&titles=${encodeURIComponent(pageTitle)}&gpllimit=500&format=json`;
+            if (continueToken) url += `&gplcontinue=${continueToken}`;
+            
+            const res = await fetch(url, { credentials: 'include' });
+            const data = await res.json();
+            
+            if (data.query && data.query.pages) {
+                for (const pid in data.query.pages) {
+                    const page = data.query.pages[pid];
+                    // ns === 0 ensures we only process main articles (not categories, files, etc.)
+                    if (page.ns === 0) {
+                        pages.push(page.title);
+                    }
+                }
+            }
+            continueToken = data.continue ? data.continue.gplcontinue : null;
+        } while (continueToken);
+        return pages;
+    }
+
     // Helper: Batch query English Wikipedia to get Wikidata QIDs (Fast!)
     async function getWikidataIds(enTitles) {
         const titleToQid = {};
-        const chunkSize = 20; // API limit is 50, using 20 to be safe with long titles
+        const chunkSize = 20; 
         for (let i = 0; i < enTitles.length; i += chunkSize) {
             const chunk = enTitles.slice(i, i + chunkSize);
             const res = await fetch('https://en.wikipedia.org/w/api.php?origin=*', {
@@ -55,7 +89,7 @@
                     }
                 }
             }
-            await new Promise(r => setTimeout(r, 100)); // Tiny delay for politeness
+            await new Promise(r => setTimeout(r, 100)); 
         }
         return titleToQid;
     }
@@ -103,9 +137,23 @@
     }
 
     // --- MAIN EXECUTION ---
-    console.log(`2. در حال دریافت لیست صفحات رده: ${categoryName}`);
-    const pagesToProcess = await getCategoryMembers(categoryName);
-    console.log(`تعداد صفحات یافت شده: ${pagesToProcess.length}`);
+    let pagesToProcess = [];
+    if (config.sourceType.toLowerCase() === "category") {
+        console.log(`در حال دریافت لیست مقالات رده: ${config.sourceValue}`);
+        pagesToProcess = await getCategoryMembers(config.sourceValue);
+    } else if (config.sourceType.toLowerCase() === "links") {
+        console.log(`در حال دریافت لیست مقالات پیوند داده شده در: ${config.sourceValue}`);
+        pagesToProcess = await getPagesLinkedOnPage(config.sourceValue);
+    } else {
+        console.error("sourceType نامعتبر است. باید 'category' یا 'links' باشد.");
+        return;
+    }
+    
+    console.log(`تعداد مقالات یافت شده: ${pagesToProcess.length}`);
+    if (pagesToProcess.length === 0) {
+        console.log("هیچ مقاله‌ای برای پردازش یافت نشد.");
+        return;
+    }
 
     let processedCount = 0;
     for (const pageTitle of pagesToProcess) {
@@ -118,7 +166,11 @@
             const pages = textData.query.pages;
             const pageId = Object.keys(pages)[0];
             
-            if (pages[pageId].missing !== undefined) continue;
+            if (pages[pageId].missing !== undefined) {
+                console.log("صفحه وجود ندارد (احتمالاً پیوند قرمز در لیست بوده است). عبور...");
+                continue;
+            }
+            
             let wikitext = pages[pageId].revisions[0]['*'];
             
             // Regex to find [[English Title]] or [[English Title|Display text]]
@@ -139,7 +191,10 @@
             
             // 1. Get QIDs from EN Wikipedia in batches
             const titleToQid = await getWikidataIds(enTitlesArray);
-            if (Object.keys(titleToQid).length === 0) continue;
+            if (Object.keys(titleToQid).length === 0) {
+                console.log("هیچ معادل ویکی‌داده‌ای یافت نشد.");
+                continue;
+            }
             
             // 2. Get Farsi Titles from Wikidata in batches
             const qids = Array.from(new Set(Object.values(titleToQid)));
@@ -168,7 +223,7 @@
             }
             
             console.log("در حال ذخیره تغییرات...");
-            const saved = await savePage(pageTitle, newWikitext, csrfToken, summary);
+            const saved = await savePage(pageTitle, newWikitext, csrfToken, config.summary);
             if (saved) {
                 console.log(`✅ صفحه ${pageTitle} با موفقیت ذخیره شد!`);
             } else {
@@ -183,5 +238,5 @@
         }
     }
     
-    console.log("\n🎉 پردازش تمام صفحات رده به پایان رسید!");
+    console.log("\n🎉 پردازش به پایان رسید!");
 })();
