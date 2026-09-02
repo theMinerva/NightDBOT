@@ -1,0 +1,441 @@
+(function() {
+    'use strict';
+
+    // ---- Configuration ----
+    const CONFIG = {
+        OCR_API: 'https://ocr.wmcloud.org/api',
+        OCR_ENGINE: 'google',
+        OCR_LANG: 'fas',
+        DELAY_MS: 1500,
+        CONCURRENCY: 20,
+        MAX_OCR_RETRIES: 3,
+        BATCH_DELAY_MS: 500,
+        TOOL_NAME: 'فهرست‌پرکن',
+        TOOL_LINK: '[[کاربر:Nightdevil/indexFiller|فهرست‌پرکن]]',
+    };
+
+    // ---- Utilities ----
+    function toPersianDigits(num) {
+        const map = {'0':'۰','1':'۱','2':'۲','3':'۳','4':'۴','5':'۵','6':'۶','7':'۷','8':'۸','9':'۹'};
+        return String(num).replace(/\d/g, d => map[d]);
+    }
+
+    function toEnglishDigits(str) {
+        const map = {'۰':'0','۱':'1','۲':'2','۳':'3','۴':'4','۵':'5','۶':'6','۷':'7','۸':'8','۹':'9'};
+        return String(str).replace(/[۰-۹]/g, d => map[d]);
+    }
+
+    // ---- DOM Helpers ----
+    function createProgressDiv() {
+        const div = document.createElement('div');
+        div.id = 'indexFillerProgress';
+        div.style.cssText = [
+            'margin: 10px 0',
+            'padding: 8px 12px',
+            'background: #f8f9fa',
+            'border: 1px solid #dee2e6',
+            'border-radius: 4px',
+            'font-size: 13px',
+            'font-family: sans-serif',
+            'color: #212529',
+            'display: none'
+        ].join(';');
+        return div;
+    }
+
+    function updateProgress(div, message, isError = false, isComplete = false) {
+        if (!div) return;
+        div.style.display = 'block';
+        div.textContent = message;
+        if (isError) {
+            div.style.background = '#f8d7da';
+            div.style.borderColor = '#f5c6cb';
+            div.style.color = '#721c24';
+        } else if (isComplete) {
+            div.style.background = '#d4edda';
+            div.style.borderColor = '#c3e6cb';
+            div.style.color = '#155724';
+        } else {
+            div.style.background = '#f8f9fa';
+            div.style.borderColor = '#dee2e6';
+            div.style.color = '#212529';
+        }
+    }
+
+    // ---- Core Functions ----
+    async function getIndexWikitext(indexTitle) {
+        const url = `https://fa.wikisource.org/w/api.php?action=parse&page=${encodeURIComponent(indexTitle)}&prop=wikitext&format=json`;
+        const res = await fetch(url);
+        const data = await res.json();
+        return data.parse.wikitext['*'];
+    }
+
+    // ---- LINE-BASED extraction for Header/Footer ----
+    function extractParamLine(wikitext, paramName) {
+        const lines = wikitext.split('\n');
+        for (const line of lines) {
+            const trimmed = line.trim();
+            const match = trimmed.match(new RegExp(`^\\|\\s*${paramName}\\s*=\\s*(.+)$`, 'i'));
+            if (match) {
+                return match[1].trim();
+            }
+        }
+        return null;
+    }
+
+    // ---- FIXED: Extract pagelist from <pagelist ... /> tag (multiline) ----
+    function extractPagelist(wikitext) {
+        const match = wikitext.match(/<pagelist\s+([^>]+)\s*\/>/s);
+        return match ? match[1].trim() : null;
+    }
+
+    function parsePagelist(pagelistStr) {
+        const entries = [];
+        const parts = pagelistStr.match(/\S+/g) || [];
+        for (const part of parts) {
+            const eq = part.indexOf('=');
+            if (eq === -1) continue;
+            let key = part.substring(0, eq).trim();
+            let value = part.substring(eq + 1).trim();
+            value = value.replace(/^"|"$/g, '');
+            const keyEng = toEnglishDigits(key);
+            let rangeMatch = keyEng.match(/^(\d+)\s*[-to]\s*(\d+)$/i);
+            if (rangeMatch) {
+                const from = parseInt(rangeMatch[1], 10);
+                const to = parseInt(rangeMatch[2], 10);
+                for (let s = from; s <= to; s++) {
+                    entries.push({ scan: s, display: value });
+                }
+            } else {
+                const scan = parseInt(keyEng, 10);
+                if (!isNaN(scan)) {
+                    entries.push({ scan, display: value });
+                }
+            }
+        }
+        return entries;
+    }
+
+    function computeDisplayedNumber(scanNumber, entries) {
+        const explicit = entries.find(e => e.scan === scanNumber);
+        if (explicit) return explicit.display;
+        let bestScan = null, bestValue = null;
+        for (const e of entries) {
+            if (e.scan < scanNumber) {
+                const num = parseInt(toEnglishDigits(e.display), 10);
+                if (!isNaN(num)) {
+                    if (!bestScan || e.scan > bestScan) {
+                        bestScan = e.scan;
+                        bestValue = num;
+                    }
+                }
+            }
+        }
+        if (bestScan !== null && bestValue !== null) {
+            const computed = bestValue + (scanNumber - bestScan);
+            return toPersianDigits(computed);
+        }
+        return null;
+    }
+
+    async function getPdfPageCount(fileName) {
+        const url = `https://fa.wikisource.org/w/api.php?action=query&titles=File:${encodeURIComponent(fileName)}&prop=imageinfo&iiprop=metadata&format=json`;
+        const res = await fetch(url);
+        const data = await res.json();
+        const pages = data.query.pages;
+        for (const pid in pages) {
+            const info = pages[pid].imageinfo;
+            if (info && info[0] && info[0].metadata) {
+                for (const meta of info[0].metadata) {
+                    if (meta.name === 'Pages') return parseInt(meta.value, 10);
+                }
+            }
+        }
+        return null;
+    }
+
+    async function pageExists(title) {
+        const url = `https://fa.wikisource.org/w/index.php?title=${encodeURIComponent(title)}&action=raw`;
+        const res = await fetch(url);
+        return res.status === 200;
+    }
+
+    async function getAllMissing(indexTitle, total, pagelistEntries, progressDiv) {
+        const base = indexTitle.replace('فهرست:', '');
+        const missing = [];
+        const totalPages = total;
+        let checked = 0;
+        let found = 0;
+
+        updateProgress(progressDiv, `🔍 در حال بررسی ${totalPages} صفحه (${CONFIG.CONCURRENCY} تایی)...`);
+
+        for (let start = 1; start <= totalPages; start += CONFIG.CONCURRENCY) {
+            const end = Math.min(start + CONFIG.CONCURRENCY - 1, totalPages);
+            const batch = [];
+            for (let scan = start; scan <= end; scan++) {
+                const scanPersian = toPersianDigits(scan);
+                const title = `برگه:${base}/${scanPersian}`;
+                batch.push({ scan, title });
+            }
+
+            const results = await Promise.all(batch.map(async (item) => {
+                const exists = await pageExists(item.title);
+                return { ...item, exists };
+            }));
+
+            for (const result of results) {
+                if (!result.exists) {
+                    const displayed = computeDisplayedNumber(result.scan, pagelistEntries);
+                    missing.push({ scan: result.scan, title: result.title, displayed });
+                    found++;
+                }
+                checked++;
+            }
+
+            updateProgress(progressDiv, `🔍 بررسی شد ${checked} از ${totalPages} — ${found} صفحه پیدا شد`);
+            if (start + CONFIG.CONCURRENCY <= totalPages) {
+                await new Promise(r => setTimeout(r, CONFIG.BATCH_DELAY_MS));
+            }
+        }
+
+        return missing;
+    }
+
+    async function getPageImageUrl(fileName, scanNumber) {
+        const filePage = `File:${fileName}`;
+        const url = `https://fa.wikisource.org/w/api.php?action=query&titles=${encodeURIComponent(filePage)}&prop=imageinfo&iiprop=url&iiurlwidth=960&format=json`;
+        const res = await fetch(url);
+        const data = await res.json();
+        const pages = data.query.pages;
+        for (const pid in pages) {
+            const info = pages[pid].imageinfo;
+            if (info && info[0]) {
+                if (info[0].thumburl) {
+                    const thumbUrl = info[0].thumburl;
+                    return thumbUrl.replace(/page\d+/, `page${scanNumber}`).split('?')[0];
+                }
+                const fileUrl = info[0].url;
+                const hashMatch = fileUrl.match(/\/commons\/([^/]+\/[^/]+)\//);
+                if (hashMatch) {
+                    const hash = hashMatch[1];
+                    const baseName = fileName.replace('.pdf', '');
+                    return `https://upload.wikimedia.org/wikipedia/commons/thumb/${hash}/${fileName}/page${scanNumber}-960px-${baseName}.jpg`;
+                }
+            }
+        }
+        throw new Error('Could not get thumbnail URL.');
+    }
+
+    async function runOCR(imageUrl, retries = CONFIG.MAX_OCR_RETRIES) {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                const url = `${CONFIG.OCR_API}?image=${encodeURIComponent(imageUrl)}&engine=${CONFIG.OCR_ENGINE}&langs[]=${CONFIG.OCR_LANG}`;
+                const res = await fetch(url);
+                const data = await res.json();
+                if (data.text && data.text.trim().length > 0) {
+                    return data.text;
+                }
+                if (data.error) console.warn(`   OCR error (attempt ${attempt}): ${data.error}`);
+                if (attempt < retries) await new Promise(r => setTimeout(r, 2000));
+            } catch (err) {
+                console.warn(`   OCR attempt ${attempt} failed: ${err.message}`);
+                if (attempt < retries) await new Promise(r => setTimeout(r, 2000));
+            }
+        }
+        return '';
+    }
+
+    async function getCsrfToken() {
+        const url = 'https://fa.wikisource.org/w/api.php?action=query&meta=tokens&format=json';
+        const res = await fetch(url);
+        const data = await res.json();
+        return data.query.tokens.csrftoken;
+    }
+
+    async function createPage(title, content, summary) {
+        const token = await getCsrfToken();
+        const form = new FormData();
+        form.append('action', 'edit');
+        form.append('title', title);
+        form.append('text', content);
+        form.append('summary', summary);
+        form.append('token', token);
+        form.append('format', 'json');
+        const res = await fetch('https://fa.wikisource.org/w/api.php', { method: 'POST', body: form });
+        const data = await res.json();
+        if (data.edit && data.edit.result === 'Success') return true;
+        throw new Error('Edit failed: ' + JSON.stringify(data));
+    }
+
+    // ---- Main Function ----
+    async function fillIndex() {
+        const indexTitle = mw.config.get('wgPageName');
+        if (!indexTitle.startsWith('فهرست:')) {
+            alert('این صفحه یک فهرست نیست.');
+            return;
+        }
+
+        const container = document.querySelector('#mw-content-text');
+        let progressDiv = document.getElementById('indexFillerProgress');
+        if (!progressDiv) {
+            progressDiv = createProgressDiv();
+            if (container) container.prepend(progressDiv);
+        }
+        updateProgress(progressDiv, '⏳ در حال آماده‌سازی...');
+
+        try {
+            console.log('🔍 در حال خواندن صفحهٔ فهرست...');
+            const wikitext = await getIndexWikitext(indexTitle);
+
+            // ---- Header/Footer using line-based extraction ----
+            let header = extractParamLine(wikitext, 'Header') || extractParamLine(wikitext, 'سرنویس') || '';
+            let footer = extractParamLine(wikitext, 'Footer') || extractParamLine(wikitext, 'پانویس') || '';
+
+            // ---- FIXED: Pagelist extraction using <pagelist ... /> tag ----
+            let pagesParam = extractPagelist(wikitext) || extractParamLine(wikitext, 'Pages') || '';
+
+            console.log('📌 Header:', header);
+            console.log('📌 Footer:', footer);
+            console.log('📌 Pages param (pagelist):', pagesParam.substring(0, 100) + '...');
+
+            if (!pagesParam) {
+                updateProgress(progressDiv, '❌ برچسب <pagelist> یا |Pages= در فهرست یافت نشد.', true);
+                return;
+            }
+            const pagelistEntries = parsePagelist(pagesParam);
+            if (pagelistEntries.length === 0) {
+                updateProgress(progressDiv, '❌ هیچ صفحه‌ای در pagelist تعریف نشده است.', true);
+                return;
+            }
+            console.log(`📄 ${pagelistEntries.length} صفحه در pagelist تعریف شده است.`);
+
+            const fileName = indexTitle.replace('فهرست:', '');
+            let total = await getPdfPageCount(fileName);
+            if (!total) {
+                const input = prompt('تعداد صفحات PDF پیدا نشد. لطفاً به‌صورت دستی وارد کنید:', '');
+                total = parseInt(input, 10);
+                if (isNaN(total) || total < 1) {
+                    updateProgress(progressDiv, '❌ تعداد صفحات نامعتبر است.', true);
+                    return;
+                }
+            }
+            console.log(`📄 تعداد کل صفحات: ${total}`);
+
+            console.log('🔍 در حال جستجوی صفحات ایجادنشده...');
+            const missing = await getAllMissing(indexTitle, total, pagelistEntries, progressDiv);
+
+            if (missing.length === 0) {
+                updateProgress(progressDiv, '✅ همهٔ صفحات قبلاً ایجاد شده‌اند.', false, true);
+                return;
+            }
+            console.log(`📋 ${missing.length} صفحه ایجاد نشده پیدا شد.`);
+            updateProgress(progressDiv, `📋 ${missing.length} صفحه پیدا شد. در حال ایجاد...`);
+
+            const username = mw.config.get('wgUserName') || '';
+            let created = 0;
+            let errors = 0;
+
+            for (let i = 0; i < missing.length; i++) {
+                const page = missing[i];
+                const scan = page.scan;
+                const title = page.title;
+
+                updateProgress(progressDiv, `⏳ در حال ایجاد صفحه ${i+1} از ${missing.length} (اسکن ${scan})...`);
+                console.log(`📄 [${i+1}/${missing.length}] ایجاد صفحه برای اسکن ${scan} (${title})`);
+
+                try {
+                    let imageUrl = await getPageImageUrl(fileName, scan);
+                    imageUrl = imageUrl.split('?')[0];
+
+                    let ocrText = await runOCR(imageUrl);
+                    console.log(`   طول OCR: ${ocrText.length} کاراکتر`);
+
+                    let qualityLevel;
+                    if (ocrText.trim().length === 0) {
+                        qualityLevel = 0;
+                        console.log('   ⚠️ OCR خالی → کیفیت ۰');
+                    } else {
+                        qualityLevel = 1;
+                    }
+
+                    // ---- BUILD PAGE WITH CORRECT HEADER/FOOTER ----
+                    let wikitextContent = `<noinclude><pagequality level="${qualityLevel}" user="${username}" />`;
+                    if (header.trim()) {
+                        wikitextContent += '\n' + header;
+                    }
+                    wikitextContent += `</noinclude>\n${ocrText}\n<noinclude>`;
+                    if (footer.trim()) {
+                        wikitextContent += '\n' + footer;
+                    }
+                    wikitextContent += `</noinclude>`;
+
+                    const summary = `ایجاد صفحهٔ ${scan} با OCR — وضعیت ${qualityLevel === 0 ? 'بی‌نوشته' : 'نمونه‌خوانی‌نشده'} (با ابزار ${CONFIG.TOOL_LINK})`;
+                    await createPage(title, wikitextContent, summary);
+                    created++;
+                    updateProgress(progressDiv, `✅ صفحه ${i+1} از ${missing.length} ایجاد شد (اسکن ${scan}).`);
+
+                    if (i < missing.length - 1) {
+                        await new Promise(r => setTimeout(r, CONFIG.DELAY_MS));
+                    }
+
+                } catch (err) {
+                    errors++;
+                    console.error(`❌ ایجاد اسکن ${scan} ناموفق:`, err.message);
+                    updateProgress(progressDiv, `❌ خطا در صفحه ${i+1} از ${missing.length} (اسکن ${scan}): ${err.message}`, true);
+                }
+            }
+
+            const finalMsg = `✅ ایجاد صفحات تمام شد. ${created} صفحه ایجاد شد، ${errors} خطا.`;
+            console.log(finalMsg);
+            updateProgress(progressDiv, finalMsg, false, true);
+
+        } catch (err) {
+            console.error('❌ خطای کلی:', err);
+            updateProgress(progressDiv, `❌ خطا: ${err.message}`, true);
+        }
+    }
+
+    // ---- Add Button ----
+    function addButton() {
+        const pageName = mw.config.get('wgPageName');
+        if (!pageName.startsWith('فهرست:')) return;
+
+        const container = document.querySelector('#mw-content-text');
+        if (!container) return;
+
+        if (document.getElementById('indexFillerButton')) return;
+
+        const btn = document.createElement('button');
+        btn.id = 'indexFillerButton';
+        btn.textContent = 'پر کردن فهرست';
+        btn.style.cssText = [
+            'margin: 5px 0',
+            'padding: 4px 10px',
+            'background: #28a745',
+            'color: white',
+            'border: none',
+            'border-radius: 3px',
+            'cursor: pointer',
+            'font-size: 13px',
+            'font-weight: bold',
+            'font-family: sans-serif'
+        ].join(';');
+
+        btn.addEventListener('click', async function() {
+            this.disabled = true;
+            this.textContent = '⏳ در حال اجرا...';
+            await fillIndex();
+            this.disabled = false;
+            this.textContent = 'پر کردن فهرست';
+        });
+
+        container.prepend(btn);
+    }
+
+    // ---- Initialize ----
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', addButton);
+    } else {
+        addButton();
+    }
+})();
