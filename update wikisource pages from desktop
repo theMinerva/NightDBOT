@@ -267,7 +267,7 @@
                 wikitextContent += `</noinclude>`;
 
                 // Create/Update page
-                const summary = `بارگذاری متن از فایل محلی (ابزار ${CONFIG.TOOL_NAME}) — کیفیت ${qualityLevel === 0 ? 'بی‌نوشته' : 'نمونه‌خوانی‌نشده'} ${CONFIG.TOOL_LINK}`;
+                const summary = `بهبود قالب‌بندی با استفاده از مدل minimax/minimax-m3`;
                 try {
                     await createPage(pageTitle, wikitextContent, summary);
                     console.log(`   ✅ صفحه ${scan} با موفقیت بارگذاری شد.`);
