@@ -1,0 +1,287 @@
+// ============================================================
+// فهرست‌دانلودر (IndexDownloader) v3
+// دانلود تمام صفحات یک فهرست به‌صورت تصویر و متن
+// ============================================================
+
+(function() {
+    'use strict';
+
+    // ---- Configuration ----
+    const CONFIG = {
+        IMAGE_WIDTH: 960,
+        DELAY_MS: 500,
+    };
+
+    // ---- Utilities ----
+    function toPersianDigits(num) {
+        const map = {'0':'۰','1':'۱','2':'۲','3':'۳','4':'۴','5':'۵','6':'۶','7':'۷','8':'۸','9':'۹'};
+        return String(num).replace(/\d/g, d => map[d]);
+    }
+
+    function toEnglishDigits(str) {
+        const map = {'۰':'0','۱':'1','۲':'2','۳':'3','۴':'4','۵':'5','۶':'6','۷':'7','۸':'8','۹':'9'};
+        return String(str).replace(/[۰-۹]/g, d => map[d]);
+    }
+
+    // ---- DOM Helpers ----
+    function createProgressDiv() {
+        const div = document.createElement('div');
+        div.id = 'indexDownloaderProgress';
+        div.style.cssText = [
+            'margin: 10px 0',
+            'padding: 8px 12px',
+            'background: #f8f9fa',
+            'border: 1px solid #dee2e6',
+            'border-radius: 4px',
+            'font-size: 13px',
+            'font-family: sans-serif',
+            'color: #212529',
+            'display: none'
+        ].join(';');
+        return div;
+    }
+
+    function updateProgress(div, message, isError = false, isComplete = false) {
+        if (!div) return;
+        div.style.display = 'block';
+        div.textContent = message;
+        if (isError) {
+            div.style.background = '#f8d7da';
+            div.style.borderColor = '#f5c6cb';
+            div.style.color = '#721c24';
+        } else if (isComplete) {
+            div.style.background = '#d4edda';
+            div.style.borderColor = '#c3e6cb';
+            div.style.color = '#155724';
+        } else {
+            div.style.background = '#f8f9fa';
+            div.style.borderColor = '#dee2e6';
+            div.style.color = '#212529';
+        }
+    }
+
+    // ---- Core Functions ----
+    async function getIndexWikitext(indexTitle) {
+        const url = `https://fa.wikisource.org/w/api.php?action=parse&page=${encodeURIComponent(indexTitle)}&prop=wikitext&format=json`;
+        const res = await fetch(url);
+        const data = await res.json();
+        return data.parse.wikitext['*'];
+    }
+
+    async function getPdfPageCount(fileName) {
+        const url = `https://fa.wikisource.org/w/api.php?action=query&titles=File:${encodeURIComponent(fileName)}&prop=imageinfo&iiprop=metadata&format=json`;
+        const res = await fetch(url);
+        const data = await res.json();
+        const pages = data.query.pages;
+        for (const pid in pages) {
+            const info = pages[pid].imageinfo;
+            if (info && info[0] && info[0].metadata) {
+                for (const meta of info[0].metadata) {
+                    if (meta.name === 'Pages') return parseInt(meta.value, 10);
+                }
+            }
+        }
+        return null;
+    }
+
+    // ---- Get page image URL using Commons API (CORRECT) ----
+    async function getPageImageUrl(fileName, scanNumber) {
+        const filePage = `File:${fileName}`;
+        const url = `https://fa.wikisource.org/w/api.php?action=query&titles=${encodeURIComponent(filePage)}&prop=imageinfo&iiprop=url&iiurlwidth=${CONFIG.IMAGE_WIDTH}&format=json`;
+        const res = await fetch(url);
+        const data = await res.json();
+        const pages = data.query.pages;
+        for (const pid in pages) {
+            const info = pages[pid].imageinfo;
+            if (info && info[0] && info[0].thumburl) {
+                const thumbUrl = info[0].thumburl;
+                // Replace the page number in the thumbnail URL
+                return thumbUrl.replace(/page\d+/, `page${scanNumber}`);
+            }
+        }
+        // Fallback: construct from file URL (less reliable but works for some)
+        const filePageObj = pages[Object.keys(pages)[0]];
+        if (filePageObj && filePageObj.imageinfo && filePageObj.imageinfo[0]) {
+            const fileUrl = filePageObj.imageinfo[0].url;
+            const hashMatch = fileUrl.match(/\/commons\/([^/]+\/[^/]+)\//);
+            if (hashMatch) {
+                const hash = hashMatch[1];
+                const baseName = fileName.replace('.pdf', '');
+                return `https://upload.wikimedia.org/wikipedia/commons/thumb/${hash}/${fileName}/page${scanNumber}-${CONFIG.IMAGE_WIDTH}px-${baseName}.jpg`;
+            }
+        }
+        throw new Error('Could not get thumbnail URL.');
+    }
+
+    async function fetchPageImage(fileName, scanNumber) {
+        const imageUrl = await getPageImageUrl(fileName, scanNumber);
+        const res = await fetch(imageUrl);
+        if (!res.ok) throw new Error(`Image fetch failed: ${res.status}`);
+        return await res.blob();
+    }
+
+    async function fetchPageText(indexTitle, scanNumber) {
+        const base = indexTitle.replace('فهرست:', '');
+        const scanPersian = toPersianDigits(scanNumber);
+        const pageTitle = `برگه:${base}/${scanPersian}`;
+        const url = `https://fa.wikisource.org/w/index.php?title=${encodeURIComponent(pageTitle)}&action=raw`;
+        const res = await fetch(url);
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error(`Text fetch failed: ${res.status}`);
+        return await res.text();
+    }
+
+    // ---- Main function ----
+    async function downloadAllPages(dirHandle) {
+        const indexTitle = mw.config.get('wgPageName');
+        if (!indexTitle.startsWith('فهرست:')) {
+            alert('این صفحه یک فهرست نیست.');
+            return;
+        }
+
+        const container = document.querySelector('#mw-content-text');
+        let progressDiv = document.getElementById('indexDownloaderProgress');
+        if (!progressDiv) {
+            progressDiv = createProgressDiv();
+            if (container) container.prepend(progressDiv);
+        }
+        updateProgress(progressDiv, '⏳ در حال آماده‌سازی...');
+
+        try {
+            const fileName = indexTitle.replace('فهرست:', '');
+            console.log(`🔍 Processing ${fileName}`);
+
+            let total = await getPdfPageCount(fileName);
+            if (!total) {
+                const input = prompt('تعداد صفحات PDF پیدا نشد. لطفاً به‌صورت دستی وارد کنید:', '');
+                const manual = parseInt(input, 10);
+                if (isNaN(manual) || manual < 1) {
+                    updateProgress(progressDiv, '❌ تعداد صفحات نامعتبر است.', true);
+                    return;
+                }
+                total = manual;
+            }
+            console.log(`📄 Total pages: ${total}`);
+
+            let successCount = 0;
+            let errorCount = 0;
+
+            for (let scan = 1; scan <= total; scan++) {
+                updateProgress(progressDiv, `⏳ در حال دانلود صفحه ${scan} از ${total}...`);
+                console.log(`📥 Page ${scan}/${total}`);
+
+                try {
+                    // ---- Image ----
+                    const imageBlob = await fetchPageImage(fileName, scan);
+                    const imageHandle = await dirHandle.getFileHandle(`${scan}.jpg`, { create: true });
+                    const writable = await imageHandle.createWritable();
+                    await writable.write(imageBlob);
+                    await writable.close();
+                    console.log(`   ✅ Image saved: ${scan}.jpg`);
+
+                    // ---- Text ----
+                    const text = await fetchPageText(indexTitle, scan);
+                    const textBlob = new Blob([text || ''], { type: 'text/plain;charset=utf-8' });
+                    const textHandle = await dirHandle.getFileHandle(`${scan}.txt`, { create: true });
+                    const txtWritable = await textHandle.createWritable();
+                    await txtWritable.write(textBlob);
+                    await txtWritable.close();
+                    console.log(`   ✅ Text saved: ${scan}.txt`);
+
+                    successCount++;
+                } catch (err) {
+                    errorCount++;
+                    console.error(`   ❌ Error on page ${scan}:`, err.message);
+                    updateProgress(progressDiv, `⚠️ خطا در صفحه ${scan}: ${err.message}`, true);
+                }
+
+                if (scan < total) {
+                    await new Promise(r => setTimeout(r, CONFIG.DELAY_MS));
+                }
+            }
+
+            const finalMsg = `✅ دانلود تمام شد. ${successCount} صفحه موفق، ${errorCount} خطا.`;
+            console.log(finalMsg);
+            updateProgress(progressDiv, finalMsg, false, true);
+
+        } catch (err) {
+            console.error('❌ خطای کلی:', err);
+            updateProgress(progressDiv, `❌ خطا: ${err.message}`, true);
+        }
+    }
+
+    // ---- Add Button ----
+    function addButton() {
+        const pageName = mw.config.get('wgPageName');
+        if (!pageName.startsWith('فهرست:')) return;
+
+        const container = document.querySelector('#mw-content-text');
+        if (!container) return;
+
+        if (document.getElementById('indexDownloaderButton')) return;
+
+        const btn = document.createElement('button');
+        btn.id = 'indexDownloaderButton';
+        btn.textContent = '📥 دانلود تمام صفحات';
+        btn.style.cssText = [
+            'margin: 5px 0',
+            'padding: 4px 10px',
+            'background: #007bff',
+            'color: white',
+            'border: none',
+            'border-radius: 3px',
+            'cursor: pointer',
+            'font-size: 13px',
+            'font-weight: bold',
+            'font-family: sans-serif'
+        ].join(';');
+
+        btn.addEventListener('click', async function() {
+            this.disabled = true;
+            this.textContent = '⏳ انتخاب پوشه...';
+
+            let dirHandle;
+            try {
+                dirHandle = await window.showDirectoryPicker();
+                console.log(`📂 Selected folder: ${dirHandle.name}`);
+            } catch (err) {
+                if (err.name === 'AbortError' || err.message.includes('abort')) {
+                    alert('انتخاب پوشه لغو شد.');
+                } else {
+                    alert('خطا در انتخاب پوشه: ' + err.message);
+                }
+                this.disabled = false;
+                this.textContent = '📥 دانلود تمام صفحات';
+                return;
+            }
+
+            // Test write permission
+            try {
+                const testHandle = await dirHandle.getFileHandle('.test_write', { create: true });
+                const testWritable = await testHandle.createWritable();
+                await testWritable.write('test');
+                await testWritable.close();
+                await dirHandle.removeEntry('.test_write');
+            } catch (err) {
+                alert('خطا: دسترسی نوشتن در این پوشه وجود ندارد. لطفاً پوشه دیگری را انتخاب کنید.');
+                this.disabled = false;
+                this.textContent = '📥 دانلود تمام صفحات';
+                return;
+            }
+
+            this.textContent = '⏳ در حال دانلود...';
+            await downloadAllPages(dirHandle);
+            this.disabled = false;
+            this.textContent = '📥 دانلود تمام صفحات';
+        });
+
+        container.prepend(btn);
+    }
+
+    // ---- Initialize ----
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', addButton);
+    } else {
+        addButton();
+    }
+})();
