@@ -1,6 +1,6 @@
 // ============================================================
-// فهرست‌بارگذاری (IndexUploader)
-// بارگذاری متن از فایل‌های محلی به صفحات ویکی‌نبشته
+// فهرست‌بارگذاری (IndexUploader) – نسخه متن ساده
+// بارگذاری متن از فایل‌های محلی بدون هیچ برچسب اضافی
 // ============================================================
 
 (function() {
@@ -8,9 +8,9 @@
 
     // ---- Configuration ----
     const CONFIG = {
-        DELAY_MS: 500,              // delay between page uploads
+        DELAY_MS: 500,
         TOOL_NAME: 'فهرست‌بارگذاری',
-        TOOL_LINK: '[[کاربر:Nightdevil/indexFiller|فهرست‌بارگذاری]]',
+        EDIT_SUMMARY: 'بهبود قالب‌بندی با استفاده از مدل minimax/minimax-m3',
         FILE_PATTERN: (num) => `${num}_out.txt`,
     };
 
@@ -18,11 +18,6 @@
     function toPersianDigits(num) {
         const map = {'0':'۰','1':'۱','2':'۲','3':'۳','4':'۴','5':'۵','6':'۶','7':'۷','8':'۸','9':'۹'};
         return String(num).replace(/\d/g, d => map[d]);
-    }
-
-    function toEnglishDigits(str) {
-        const map = {'۰':'0','۱':'1','۲':'2','۳':'3','۴':'4','۵':'5','۶':'6','۷':'7','۸':'8','۹':'9'};
-        return String(str).replace(/[۰-۹]/g, d => map[d]);
     }
 
     // ---- DOM Helpers ----
@@ -70,52 +65,7 @@
         return data.parse.wikitext['*'];
     }
 
-    // ---- Line-based extraction for Header/Footer ----
-    function extractParamLine(wikitext, paramName) {
-        const lines = wikitext.split('\n');
-        for (const line of lines) {
-            const trimmed = line.trim();
-            const match = trimmed.match(new RegExp(`^\\|\\s*${paramName}\\s*=\\s*(.+)$`, 'i'));
-            if (match) {
-                return match[1].trim();
-            }
-        }
-        return null;
-    }
-
-    // ---- Extract pagelist from <pagelist ... /> tag ----
-    function extractPagelist(wikitext) {
-        const match = wikitext.match(/<pagelist\s+([^>]+)\s*\/>/s);
-        return match ? match[1].trim() : null;
-    }
-
-    function parsePagelist(pagelistStr) {
-        const entries = [];
-        const parts = pagelistStr.match(/\S+/g) || [];
-        for (const part of parts) {
-            const eq = part.indexOf('=');
-            if (eq === -1) continue;
-            let key = part.substring(0, eq).trim();
-            let value = part.substring(eq + 1).trim();
-            value = value.replace(/^"|"$/g, '');
-            const keyEng = toEnglishDigits(key);
-            let rangeMatch = keyEng.match(/^(\d+)\s*[-to]\s*(\d+)$/i);
-            if (rangeMatch) {
-                const from = parseInt(rangeMatch[1], 10);
-                const to = parseInt(rangeMatch[2], 10);
-                for (let s = from; s <= to; s++) {
-                    entries.push({ scan: s, display: value });
-                }
-            } else {
-                const scan = parseInt(keyEng, 10);
-                if (!isNaN(scan)) {
-                    entries.push({ scan, display: value });
-                }
-            }
-        }
-        return entries;
-    }
-
+    // ---- Extract total page count from PDF ----
     async function getPdfPageCount(fileName) {
         const url = `https://fa.wikisource.org/w/api.php?action=query&titles=File:${encodeURIComponent(fileName)}&prop=imageinfo&iiprop=metadata&format=json`;
         const res = await fetch(url);
@@ -140,7 +90,7 @@
         return data.query.tokens.csrftoken;
     }
 
-    // ---- API: Create/Update page ----
+    // ---- API: Create/Update page with plain text ----
     async function createPage(title, content, summary) {
         const token = await getCsrfToken();
         const form = new FormData();
@@ -173,18 +123,6 @@
         updateProgress(progressDiv, '⏳ در حال آماده‌سازی...');
 
         try {
-            // 1. Extract Index data
-            const wikitext = await getIndexWikitext(indexTitle);
-            let header = extractParamLine(wikitext, 'Header') || extractParamLine(wikitext, 'سرنویس') || '';
-            let footer = extractParamLine(wikitext, 'Footer') || extractParamLine(wikitext, 'پانویس') || '';
-            let pagesParam = extractPagelist(wikitext) || extractParamLine(wikitext, 'Pages') || '';
-            const pagelistEntries = parsePagelist(pagesParam);
-
-            console.log('📌 Header:', header);
-            console.log('📌 Footer:', footer);
-            console.log(`📄 ${pagelistEntries.length} page definitions in pagelist.`);
-
-            // 2. Get total pages
             const fileName = indexTitle.replace('فهرست:', '');
             let total = await getPdfPageCount(fileName);
             if (!total) {
@@ -197,7 +135,7 @@
             }
             console.log(`📄 Total pages: ${total}`);
 
-            // 3. List files in the selected folder
+            // List files in the selected folder
             let entries = [];
             try {
                 for await (const entry of dirHandle.values()) {
@@ -206,24 +144,21 @@
             } catch (err) {
                 console.warn('Could not list folder contents:', err);
             }
-            // Build a set of filenames for quick lookup
             const fileNames = new Set();
             for (const entry of entries) {
                 if (entry.kind === 'file') {
                     fileNames.add(entry.name);
                 }
             }
-            console.log(`📂 Found ${fileNames.size} files in folder.`);
+            console.log(`📂 Found ${fileNames.size} files.`);
 
-            // 4. Iterate pages and upload if corresponding file exists
-            const username = mw.config.get('wgUserName') || '';
             let successCount = 0;
             let errorCount = 0;
             let skippedCount = 0;
 
             for (let scan = 1; scan <= total; scan++) {
-                const fileNamePattern = CONFIG.FILE_PATTERN(scan); // e.g., "15_out.txt"
-                updateProgress(progressDiv, `⏳ در حال بررسی صفحه ${scan} از ${total} (فایل: ${fileNamePattern})...`);
+                const fileNamePattern = CONFIG.FILE_PATTERN(scan);
+                updateProgress(progressDiv, `⏳ صفحه ${scan} / ${total} — فایل: ${fileNamePattern}`);
                 console.log(`📄 Page ${scan} - looking for ${fileNamePattern}`);
 
                 if (!fileNames.has(fileNamePattern)) {
@@ -232,44 +167,32 @@
                     continue;
                 }
 
-                // Read the file
+                // Read file
                 let fileHandle;
                 try {
                     fileHandle = await dirHandle.getFileHandle(fileNamePattern);
                 } catch (err) {
-                    console.error(`   ❌ Could not get file handle: ${err.message}`);
+                    console.error(`   ❌ خطا در دریافت فایل: ${err.message}`);
                     errorCount++;
                     continue;
                 }
                 const file = await fileHandle.getFile();
                 const content = await file.text();
-                if (!content || content.trim().length === 0) {
-                    console.log(`   ⚠️ فایل خالی است، کیفیت ۰ خواهد بود.`);
-                }
 
-                // Determine quality (1 if content not empty, else 0)
-                const qualityLevel = content.trim().length > 0 ? 1 : 0;
+                if (!content || content.trim().length === 0) {
+                    console.log(`   ⚠️ فایل خالی است.`);
+                }
 
                 // Build page title (with Persian digits)
                 const base = indexTitle.replace('فهرست:', '');
                 const scanPersian = toPersianDigits(scan);
                 const pageTitle = `برگه:${base}/${scanPersian}`;
 
-                // Build wikitext
-                let wikitextContent = `<noinclude><pagequality level="${qualityLevel}" user="${username}" />`;
-                if (header.trim()) {
-                    wikitextContent += '\n' + header;
-                }
-                wikitextContent += `</noinclude>\n${content}\n<noinclude>`;
-                if (footer.trim()) {
-                    wikitextContent += '\n' + footer;
-                }
-                wikitextContent += `</noinclude>`;
+                // ---- SAVE ONLY THE RAW TEXT (no tags, no markup) ----
+                const wikitextContent = content; // just the plain text from the file
 
-                // Create/Update page
-                const summary = `بهبود قالب‌بندی با استفاده از مدل minimax/minimax-m3`;
                 try {
-                    await createPage(pageTitle, wikitextContent, summary);
+                    await createPage(pageTitle, wikitextContent, CONFIG.EDIT_SUMMARY);
                     console.log(`   ✅ صفحه ${scan} با موفقیت بارگذاری شد.`);
                     successCount++;
                 } catch (err) {
@@ -277,7 +200,6 @@
                     errorCount++;
                 }
 
-                // Delay
                 if (scan < total) {
                     await new Promise(r => setTimeout(r, CONFIG.DELAY_MS));
                 }
@@ -305,7 +227,7 @@
 
         const btn = document.createElement('button');
         btn.id = 'indexUploaderButton';
-        btn.textContent = '📤 بارگذاری از فایل‌های محلی';
+        btn.textContent = '📤 بارگذاری متن از فایل‌های محلی';
         btn.style.cssText = [
             'margin: 5px 0',
             'padding: 4px 10px',
@@ -334,27 +256,26 @@
                     alert('خطا در انتخاب پوشه: ' + err.message);
                 }
                 this.disabled = false;
-                this.textContent = '📤 بارگذاری از فایل‌های محلی';
+                this.textContent = '📤 بارگذاری متن از فایل‌های محلی';
                 return;
             }
 
             // Test read permission
             try {
-                // Try to list files to verify read access
                 for await (const entry of dirHandle.values()) {
-                    break; // just check if we can iterate
+                    break;
                 }
             } catch (err) {
                 alert('خطا: دسترسی خواندن به این پوشه وجود ندارد. لطفاً پوشه دیگری را انتخاب کنید.');
                 this.disabled = false;
-                this.textContent = '📤 بارگذاری از فایل‌های محلی';
+                this.textContent = '📤 بارگذاری متن از فایل‌های محلی';
                 return;
             }
 
             this.textContent = '⏳ در حال بارگذاری...';
             await uploadFromLocal(dirHandle);
             this.disabled = false;
-            this.textContent = '📤 بارگذاری از فایل‌های محلی';
+            this.textContent = '📤 بارگذاری متن از فایل‌های محلی';
         });
 
         container.prepend(btn);
